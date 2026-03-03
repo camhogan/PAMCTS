@@ -5,11 +5,16 @@ import gym
 
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Activation, Flatten
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers.legacy import Adam
 
 from rl.agents.dqn import DQNAgent
 from rl.policy import BoltzmannQPolicy, EpsGreedyQPolicy
 from rl.memory import SequentialMemory
+
+try:
+    from Cartpole.gym_compat import make_legacy_env
+except ModuleNotFoundError:
+    from gym_compat import make_legacy_env
 
 # from rl.callbacks import WandbLogger
 
@@ -18,7 +23,7 @@ ENV_NAME = 'FrozenLake-v1'
 
 
 # Get the environment and extract the number of actions.
-env = gym.make(ENV_NAME, is_slippery=True, map_name="4x4", desc=None)
+env = make_legacy_env(ENV_NAME, is_slippery=True, map_name="4x4", desc=None)
 # env._max_episode_steps = 2500# 2500
 # env.reward_threshold = 2500
 
@@ -67,7 +72,7 @@ dqn = DQNAgent(model=model,
                nb_steps_warmup=500,
                # enable_dueling_network=True,
                # dueling_type='avg',
-               target_model_update=1e-2,
+               target_model_update=1000,
                policy=policy,
                gamma=.9,
                train_interval=4,

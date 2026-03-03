@@ -5,11 +5,16 @@ import gym
 
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Activation, Flatten
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers.legacy import Adam
 
 from rl.agents.dqn import DQNAgent
 from rl.policy import BoltzmannQPolicy
 from rl.memory import SequentialMemory
+
+try:
+    from Cartpole.gym_compat import make_legacy_env
+except ModuleNotFoundError:
+    from gym_compat import make_legacy_env
 
 # from rl.callbacks import WandbLogger
 
@@ -18,7 +23,7 @@ ENV_NAME = 'CartPole-v1'
 
 
 # Get the environment and extract the number of actions.
-env = gym.make(ENV_NAME)
+env = make_legacy_env(ENV_NAME)
 env._max_episode_steps = 2500# 2500
 env.reward_threshold = 2500
 env.env.gravity = 100
@@ -65,7 +70,7 @@ dqn = DQNAgent(model=model,
                nb_steps_warmup=500,
                # enable_dueling_network=True,
                # dueling_type='avg',
-               target_model_update=1e-2,
+               target_model_update=1000,
                policy=policy,
                gamma=.999,
                train_interval=4,

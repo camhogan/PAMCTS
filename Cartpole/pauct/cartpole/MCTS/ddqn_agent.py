@@ -1,6 +1,6 @@
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Activation, Flatten
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers.legacy import Adam
 
 from rl.agents.dqn import DQNAgent
 from rl.policy import BoltzmannQPolicy
@@ -33,7 +33,7 @@ class DDQN_Learning_Agent():
                                   nb_steps_warmup=500,
                                   # enable_dueling_network=True,
                                   # dueling_type='avg',
-                                  target_model_update=1e-2,
+                                  target_model_update=1000,
                                   policy=policy,
                                   gamma=.99,
                                   train_interval=4,
