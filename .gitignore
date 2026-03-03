@@ -1,0 +1,114 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+venv*/
+env/
+.env/
+.venv/
+venPAM/
+venPAMCTS/
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# TensorFlow / PyTorch
+# =========================
+*.ckpt
+*.h5
+*.pb
+*.pt
+*.pth
+*.onnx
+*.tfevents*
+runs/
+checkpoints/
+
+# =========================
+# Data / Outputs
+# =========================
+data/
+datasets/
+output/
+outputs/
+results/
+figures/
+plots/
+
+# =========================
+# macOS
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# =========================
+# VSCode
+# =========================
+.vscode/
+
+# =========================
+# PyCharm
+# =========================
+.idea/
+
+# =========================
+# Coverage / Testing
+# =========================
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# =========================
+# MyPy
+# =========================
+.mypy_cache/
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.*
+
+# =========================
+# System
+# =========================
+Thumbs.db
