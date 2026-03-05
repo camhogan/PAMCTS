@@ -37,6 +37,44 @@ pip install --upgrade botocore google-auth
 ```
 
 ## Run Experiments
+### DDQN Non-Stationary Optimizer Sweep (CartPole + FrozenLake)
+Run from the repo root:
+```
+./venvPAM/bin/python ddqn_nonstationary_sweep.py \
+  --domains cartpole frozenlake \
+  --optimizers sgd sgd_momentum sgd_nag adamw rmsprop muon \
+  --output-dir results/ddqn_nonstationary_sweep
+```
+
+
+The script writes a timestamped run folder:
+```
+results/ddqn_nonstationary_sweep/run_YYYYMMDD_HHMMSS/
+```
+
+Key output files:
+```
+summary_training.csv
+summary_shifted_envs.csv
+all_histories.csv
+all_evals.csv
+all_shift_evals.csv
+```
+
+Plot a single run:
+```
+env MPLCONFIGDIR=/tmp/mpl ./venvPAM/bin/python plot_ddqn_results.py \
+  results/ddqn_nonstationary_sweep/run_YYYYMMDD_HHMMSS
+```
+
+Compare two runs in one set of plots (example: baseline optimizer run + MUON run):
+```
+env MPLCONFIGDIR=/tmp/mpl ./venvPAM/bin/python plot_ddqn_comparison.py \
+  results/ddqn_nonstationary_sweep/run_20260302_205258 \
+  results/ddqn_nonstationary_sweep_muon/run_YYYYMMDD_HHMMSS \
+  --output-dir results/ddqn_nonstationary_comparison_plots
+```
+
 ### Cartpole:
 Train DDQN Agent:
 ```
