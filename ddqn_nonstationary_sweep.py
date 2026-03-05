@@ -72,6 +72,90 @@ class QNetwork(nn.Module):
         return self.layers(x)
 
 
+class Muon(torch.optim.Optimizer):
+    """Single-device Muon optimizer aligned with Keller Jordan's reference logic."""
+
+    def __init__(
+        self,
+        params,
+        lr=0.001,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        eps=1e-8,
+        weight_decay=0.0,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _zeropower_via_newtonschulz5(grad, steps: int):
+        """Reference NS5 orthogonalization used by Muon."""
+        assert grad.ndim >= 2
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        x = grad.bfloat16()
+        if grad.size(-2) > grad.size(-1):
+            x = x.mT
+        x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        for _ in range(steps):
+            a_mat = x @ x.mT
+            b_mat = b * a_mat + c * a_mat @ a_mat
+            x = a * x + b_mat @ x
+        if grad.size(-2) > grad.size(-1):
+            x = x.mT
+        return x
+
+    @classmethod
+    def _muon_update(cls, grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+        momentum.lerp_(grad, 1 - beta)
+        update = grad.lerp_(momentum, beta) if nesterov else momentum
+        if update.ndim < 2:
+            return update
+        if update.ndim == 4:
+            update = update.view(len(update), -1)
+        update = cls._zeropower_via_newtonschulz5(update, steps=ns_steps)
+        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+        return update.to(dtype=grad.dtype)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr, beta = group["lr"], group["momentum"]
+            nesterov, ns_steps = group["nesterov"], group["ns_steps"]
+            wd = group["weight_decay"]
+
+            for param in group["params"]:
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+
+                if wd > 0:
+                    param.data.mul_(1.0 - lr * wd)
+
+                state = self.state[param]
+                buf = state.setdefault("momentum_buffer", torch.zeros_like(param))
+                update = self._muon_update(
+                    param.grad,
+                    buf,
+                    beta=beta,
+                    ns_steps=ns_steps,
+                    nesterov=nesterov,
+                )
+                param.data.add_(update.reshape(param.shape), alpha=-lr)
+
+        return loss
+
+
 class CartPoleTask:
     name = "cartpole"
     state_dim = 4
@@ -246,8 +330,8 @@ def parse_args():
     parser.add_argument(
         "--optimizers",
         nargs="+",
-        default=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop"],
-        choices=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop"],
+        default=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop", "muon"],
+        choices=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop", "muon"],
         help="Optimizers to compare.",
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=list(range(30)), help="Seeds to run.")
@@ -281,7 +365,11 @@ def parse_args():
     parser.add_argument("--sgd-nag-lr", type=float, default=0.01, help="Learning rate for SGD with Nesterov momentum.")
     parser.add_argument("--adamw-lr", type=float, default=0.001, help="Learning rate for AdamW.")
     parser.add_argument("--rmsprop-lr", type=float, default=0.001, help="Learning rate for RMSprop.")
+    parser.add_argument("--muon-lr", type=float, default=0.001, help="Learning rate for Muon.")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum used for SGD variants.")
+    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Momentum used for Muon.")
+    parser.add_argument("--muon-ns-steps", type=int, default=5, help="Newton-Schulz iterations for Muon.")
+    parser.add_argument("--muon-weight-decay", type=float, default=0.0, help="Decoupled weight decay for Muon.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--cartpole-gravity-settings", nargs="+", type=float, default=[9.8, 20.0, 50.0, 500.0], help="CartPole gravity shifts.")
     parser.add_argument("--cartpole-masscart-settings", nargs="+", type=float, default=[0.1, 1.0, 1.2, 1.3, 1.5], help="CartPole masscart shifts.")
@@ -312,6 +400,15 @@ def optimizer_spec(name: str, args):
     if name == "rmsprop":
         lr = args.shared_lr if args.shared_lr is not None else args.rmsprop_lr
         return {"name": name, "lr": lr}
+    if name == "muon":
+        lr = args.shared_lr if args.shared_lr is not None else args.muon_lr
+        return {
+            "name": name,
+            "lr": lr,
+            "momentum": args.muon_momentum,
+            "ns_steps": args.muon_ns_steps,
+            "weight_decay": args.muon_weight_decay,
+        }
     raise ValueError(f"Unsupported optimizer: {name}")
 
 
@@ -320,6 +417,14 @@ def build_optimizer(parameters, spec):
         return torch.optim.AdamW(parameters, lr=spec["lr"], weight_decay=spec["weight_decay"])
     if spec["name"] == "rmsprop":
         return torch.optim.RMSprop(parameters, lr=spec["lr"])
+    if spec["name"] == "muon":
+        return Muon(
+            parameters,
+            lr=spec["lr"],
+            momentum=spec["momentum"],
+            ns_steps=spec["ns_steps"],
+            weight_decay=spec["weight_decay"],
+        )
     return torch.optim.SGD(
         parameters,
         lr=spec["lr"],
