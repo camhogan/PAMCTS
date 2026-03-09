@@ -156,6 +156,46 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+class HybridOptimizer:
+    """Thin wrapper that steps multiple optimizers as one."""
+
+    def __init__(self, *optimizers):
+        self.optimizers = [opt for opt in optimizers if opt is not None]
+        if not self.optimizers:
+            raise ValueError("HybridOptimizer requires at least one inner optimizer")
+
+    @property
+    def param_groups(self):
+        groups = []
+        for optimizer in self.optimizers:
+            groups.extend(optimizer.param_groups)
+        return groups
+
+    def zero_grad(self, set_to_none=True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        for optimizer in self.optimizers:
+            optimizer.step()
+        return loss
+
+    def state_dict(self):
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        optimizer_states = state_dict.get("optimizers", [])
+        if len(optimizer_states) != len(self.optimizers):
+            raise ValueError(
+                f"Expected {len(self.optimizers)} optimizer states, got {len(optimizer_states)}"
+            )
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+            optimizer.load_state_dict(optimizer_state)
+
+
 class CartPoleTask:
     name = "cartpole"
     state_dim = 4
@@ -366,10 +406,22 @@ def parse_args():
     parser.add_argument("--adamw-lr", type=float, default=0.001, help="Learning rate for AdamW.")
     parser.add_argument("--rmsprop-lr", type=float, default=0.001, help="Learning rate for RMSprop.")
     parser.add_argument("--muon-lr", type=float, default=0.001, help="Learning rate for Muon.")
+    parser.add_argument(
+        "--muon-adamw-lr",
+        type=float,
+        default=None,
+        help="Learning rate for AdamW fallback parameters when using Muon (defaults to Muon LR).",
+    )
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum used for SGD variants.")
     parser.add_argument("--muon-momentum", type=float, default=0.95, help="Momentum used for Muon.")
     parser.add_argument("--muon-ns-steps", type=int, default=5, help="Newton-Schulz iterations for Muon.")
     parser.add_argument("--muon-weight-decay", type=float, default=0.0, help="Decoupled weight decay for Muon.")
+    parser.add_argument(
+        "--muon-adamw-weight-decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for AdamW fallback parameters when using Muon.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--cartpole-gravity-settings", nargs="+", type=float, default=[9.8, 20.0, 50.0, 500.0], help="CartPole gravity shifts.")
     parser.add_argument("--cartpole-masscart-settings", nargs="+", type=float, default=[0.1, 1.0, 1.2, 1.3, 1.5], help="CartPole masscart shifts.")
@@ -402,29 +454,71 @@ def optimizer_spec(name: str, args):
         return {"name": name, "lr": lr}
     if name == "muon":
         lr = args.shared_lr if args.shared_lr is not None else args.muon_lr
+        fallback_lr = args.shared_lr if args.shared_lr is not None else args.muon_adamw_lr
+        if fallback_lr is None:
+            fallback_lr = lr
         return {
             "name": name,
             "lr": lr,
             "momentum": args.muon_momentum,
             "ns_steps": args.muon_ns_steps,
             "weight_decay": args.muon_weight_decay,
+            "fallback_lr": fallback_lr,
+            "fallback_weight_decay": args.muon_adamw_weight_decay,
         }
     raise ValueError(f"Unsupported optimizer: {name}")
 
 
-def build_optimizer(parameters, spec):
+def split_muon_param_groups(model: nn.Module):
+    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    matrix_param_names = [name for name, param in named_params if param.ndim >= 2]
+
+    input_output_matrix_names = set()
+    if matrix_param_names:
+        input_output_matrix_names.add(matrix_param_names[0])
+        input_output_matrix_names.add(matrix_param_names[-1])
+
+    muon_params = []
+    fallback_params = []
+    for name, param in named_params:
+        if param.ndim >= 2 and name not in input_output_matrix_names:
+            muon_params.append(param)
+        else:
+            fallback_params.append(param)
+
+    return muon_params, fallback_params
+
+
+def build_optimizer(parameters, spec, model=None):
     if spec["name"] == "adamw":
         return torch.optim.AdamW(parameters, lr=spec["lr"], weight_decay=spec["weight_decay"])
     if spec["name"] == "rmsprop":
         return torch.optim.RMSprop(parameters, lr=spec["lr"])
     if spec["name"] == "muon":
-        return Muon(
-            parameters,
-            lr=spec["lr"],
-            momentum=spec["momentum"],
-            ns_steps=spec["ns_steps"],
-            weight_decay=spec["weight_decay"],
+        if model is None:
+            raise ValueError("Muon optimizer requires a model for parameter partitioning")
+        muon_params, fallback_params = split_muon_param_groups(model)
+        muon_opt = (
+            Muon(
+                muon_params,
+                lr=spec["lr"],
+                momentum=spec["momentum"],
+                ns_steps=spec["ns_steps"],
+                weight_decay=spec["weight_decay"],
+            )
+            if muon_params
+            else None
         )
+        fallback_opt = (
+            torch.optim.AdamW(
+                fallback_params,
+                lr=spec["fallback_lr"],
+                weight_decay=spec["fallback_weight_decay"],
+            )
+            if fallback_params
+            else None
+        )
+        return HybridOptimizer(muon_opt, fallback_opt)
     return torch.optim.SGD(
         parameters,
         lr=spec["lr"],
@@ -556,7 +650,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     target_net = QNetwork(task.state_dim, task.action_dim).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     spec = optimizer_spec(optimizer_name, args)
-    optimizer = build_optimizer(policy_net.parameters(), spec)
+    optimizer = build_optimizer(policy_net.parameters(), spec, model=policy_net)
     replay_buffer = ReplayBuffer(args.buffer_size)
 
     history_rows = []
