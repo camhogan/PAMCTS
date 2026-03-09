@@ -17,9 +17,9 @@ from torch import nn
 
 CARTPOLE_ENV_NAME = "CartPole-v1"
 FROZENLAKE_MAP = ["SHF", "FFF", "HFG"]
-FROZENLAKE_BASELINE = (1.0, 1.0, 1.0)
+FROZENLAKE_BASELINE = (1.0, 0.0, 0.0)
 FROZENLAKE_SHIFT_SETTINGS = [
-    (1.0, 1.0, 1.0),
+    (1.0, 0.0, 0.0),
     (0.833, 0.083, 0.083),
     (0.633, 0.183, 0.183),
     (0.433, 0.283, 0.283),
@@ -560,20 +560,8 @@ def parse_args():
         help="Optimizers to compare.",
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=list(range(30)), help="Seeds to run.")
-    parser.add_argument(
-        "--cartpole-episodes",
-        type=int,
-        default=0,
-        help="Maximum training episodes per CartPole run (0 disables episode cap).",
-    )
-    parser.add_argument(
-        "--frozenlake-episodes",
-        type=int,
-        default=0,
-        help="Maximum training episodes per FrozenLake run (0 disables episode cap).",
-    )
-    parser.add_argument("--cartpole-train-steps", type=int, default=300000, help="Environment-step training budget for CartPole.")
-    parser.add_argument("--frozenlake-train-steps", type=int, default=1000000, help="Environment-step training budget for FrozenLake.")
+    parser.add_argument("--cartpole-episodes", type=int, default=400, help="Training episodes per CartPole run.")
+    parser.add_argument("--frozenlake-episodes", type=int, default=600, help="Training episodes per FrozenLake run.")
     parser.add_argument("--cartpole-max-steps", type=int, default=2500, help="CartPole step cap per episode.")
     parser.add_argument("--frozenlake-max-steps", type=int, default=200, help="FrozenLake step cap per episode.")
     parser.add_argument("--batch-size", type=int, default=64, help="Replay batch size.")
@@ -860,17 +848,9 @@ def get_task(name: str, args):
 
 def get_domain_hyperparams(name: str, args):
     if name == "cartpole":
-        return {
-            "episode_cap": args.cartpole_episodes,
-            "train_steps": args.cartpole_train_steps,
-            "gamma": args.cartpole_gamma,
-        }
+        return {"episodes": args.cartpole_episodes, "gamma": args.cartpole_gamma}
     if name == "frozenlake":
-        return {
-            "episode_cap": args.frozenlake_episodes,
-            "train_steps": args.frozenlake_train_steps,
-            "gamma": args.frozenlake_gamma,
-        }
+        return {"episodes": args.frozenlake_episodes, "gamma": args.frozenlake_gamma}
     raise ValueError(f"Unsupported domain: {name}")
 
 
@@ -904,8 +884,7 @@ def build_baseline_env_kwargs(domain_name: str):
 def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args, run_dir: Path, device: torch.device):
     task = get_task(domain_name, args)
     hyperparams = get_domain_hyperparams(domain_name, args)
-    episode_cap = hyperparams["episode_cap"]
-    train_steps = hyperparams["train_steps"]
+    episodes = hyperparams["episodes"]
     gamma = hyperparams["gamma"]
     set_all_seeds(seed)
 
@@ -946,14 +925,11 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     start_time = time.time()
 
     print(
-        f"[start] domain={domain_name} optimizer={optimizer_name} seed={seed} "
-        f"train_steps={train_steps} episode_cap={episode_cap}",
+        f"[start] domain={domain_name} optimizer={optimizer_name} seed={seed} episodes={episodes}",
         flush=True,
     )
 
-    episode = 0
-    while total_steps < train_steps and (episode_cap <= 0 or episode < episode_cap):
-        episode += 1
+    for episode in range(1, episodes + 1):
         state = task.reset(env, seed + episode)
         episode_reward = 0.0
         episode_losses = []
@@ -983,7 +959,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             if total_steps % args.target_update_frequency == 0:
                 target_net.load_state_dict(policy_net.state_dict())
 
-            if done or total_steps >= train_steps:
+            if done:
                 break
 
         history_rows.append(
@@ -999,7 +975,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             }
         )
 
-        if episode % args.eval_every == 0 or total_steps >= train_steps:
+        if episode % args.eval_every == 0 or episode == episodes:
             baseline_rewards = evaluate_on_task(
                 policy_net,
                 task,
@@ -1020,7 +996,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             )
             print(
                 f"[progress] domain={domain_name} optimizer={optimizer_name} seed={seed} "
-                f"episode={episode} steps={total_steps}/{train_steps} train_reward={episode_reward:.3f} "
+                f"episode={episode}/{episodes} train_reward={episode_reward:.3f} "
                 f"baseline_eval_mean={np.mean(baseline_rewards):.3f}",
                 flush=True,
             )
@@ -1080,9 +1056,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
         "optimizer": optimizer_name,
         "seed": seed,
         "optimizer_config": json.dumps(spec, sort_keys=True),
-        "episodes": episode,
-        "episode_cap": episode_cap,
-        "train_steps_budget": train_steps,
+        "episodes": episodes,
         "max_steps": task.max_steps,
         "total_steps": total_steps,
         "elapsed_seconds": time.time() - start_time,
