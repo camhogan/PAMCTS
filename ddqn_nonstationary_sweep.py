@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import random
 import time
@@ -84,6 +85,10 @@ class Muon(torch.optim.Optimizer):
         ns_steps=5,
         eps=1e-8,
         weight_decay=0.0,
+        param_name_map=None,
+        spectrum_logger=None,
+        spectrum_every=0,
+        spectrum_topk=0,
     ):
         defaults = dict(
             lr=lr,
@@ -94,6 +99,11 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
+        self.param_name_map = param_name_map or {}
+        self.spectrum_logger = spectrum_logger
+        self.spectrum_every = max(0, int(spectrum_every))
+        self.spectrum_topk = int(spectrum_topk)
+        self._step = 0
 
     @staticmethod
     def _zeropower_via_newtonschulz5(grad, steps: int):
@@ -117,18 +127,52 @@ class Muon(torch.optim.Optimizer):
         momentum.lerp_(grad, 1 - beta)
         update = grad.lerp_(momentum, beta) if nesterov else momentum
         if update.ndim < 2:
-            return update
+            return update, None, None
         if update.ndim == 4:
             update = update.view(len(update), -1)
-        update = cls._zeropower_via_newtonschulz5(update, steps=ns_steps)
-        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
-        return update.to(dtype=grad.dtype)
+        raw_update = update.detach().float()
+        ortho_update = cls._zeropower_via_newtonschulz5(update, steps=ns_steps)
+        ortho_update *= max(1, ortho_update.size(-2) / ortho_update.size(-1)) ** 0.5
+        return ortho_update.to(dtype=grad.dtype), raw_update, ortho_update.detach().float()
+
+    def _log_update_spectrum(self, param, raw_update, ortho_update):
+        if self.spectrum_logger is None:
+            return
+
+        param_name = self.param_name_map.get(id(param), "<unnamed>")
+        for update_kind, update in (("raw_update", raw_update), ("ortho_update", ortho_update)):
+            full_values = torch.linalg.svdvals(update).cpu().tolist()
+            sigma_max = float(full_values[0]) if full_values else None
+            sigma_min = float(full_values[-1]) if full_values else None
+            if sigma_max is None or sigma_min is None:
+                condition_number = None
+            elif sigma_min <= 1e-12:
+                condition_number = float("inf")
+            else:
+                condition_number = float(sigma_max / sigma_min)
+            values = full_values
+            if self.spectrum_topk > 0:
+                values = values[: self.spectrum_topk]
+            self.spectrum_logger(
+                {
+                    "optimizer_step": self._step,
+                    "param_name": param_name,
+                    "update_kind": update_kind,
+                    "singular_values": values,
+                    "sigma_max": sigma_max,
+                    "sigma_min": sigma_min,
+                    "condition_number": condition_number,
+                }
+            )
 
     def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        self._step += 1
+        log_spectrum = self.spectrum_logger is not None and self.spectrum_every > 0 and self._step % self.spectrum_every == 0
 
         for group in self.param_groups:
             lr, beta = group["lr"], group["momentum"]
@@ -144,13 +188,15 @@ class Muon(torch.optim.Optimizer):
 
                 state = self.state[param]
                 buf = state.setdefault("momentum_buffer", torch.zeros_like(param))
-                update = self._muon_update(
+                update, raw_update, ortho_update = self._muon_update(
                     param.grad,
                     buf,
                     beta=beta,
                     ns_steps=ns_steps,
                     nesterov=nesterov,
                 )
+                if log_spectrum and raw_update is not None and ortho_update is not None:
+                    self._log_update_spectrum(param, raw_update, ortho_update)
                 param.data.add_(update.reshape(param.shape), alpha=-lr)
 
         return loss
@@ -159,10 +205,20 @@ class Muon(torch.optim.Optimizer):
 class HybridOptimizer:
     """Thin wrapper that steps multiple optimizers as one."""
 
-    def __init__(self, *optimizers):
+    def __init__(
+        self,
+        *optimizers,
+        adamw_momentum_logger=None,
+        adamw_momentum_every=0,
+        adamw_param_name_map=None,
+    ):
         self.optimizers = [opt for opt in optimizers if opt is not None]
         if not self.optimizers:
             raise ValueError("HybridOptimizer requires at least one inner optimizer")
+        self.adamw_momentum_logger = adamw_momentum_logger
+        self.adamw_momentum_every = max(0, int(adamw_momentum_every))
+        self.adamw_param_name_map = adamw_param_name_map or {}
+        self._step = 0
 
     @property
     def param_groups(self):
@@ -179,8 +235,15 @@ class HybridOptimizer:
         loss = None
         if closure is not None:
             loss = closure()
+        self._step += 1
         for optimizer in self.optimizers:
             optimizer.step()
+        if (
+            self.adamw_momentum_logger is not None
+            and self.adamw_momentum_every > 0
+            and self._step % self.adamw_momentum_every == 0
+        ):
+            self._log_adamw_momentum()
         return loss
 
     def state_dict(self):
@@ -194,6 +257,128 @@ class HybridOptimizer:
             )
         for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
             optimizer.load_state_dict(optimizer_state)
+
+    def _log_adamw_momentum(self):
+        for optimizer in self.optimizers:
+            if not isinstance(optimizer, torch.optim.AdamW):
+                continue
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    state = optimizer.state.get(param)
+                    if not state:
+                        continue
+                    exp_avg = state.get("exp_avg")
+                    if exp_avg is None:
+                        continue
+                    exp_avg_f = exp_avg.detach().float()
+                    exp_avg_sq = state.get("exp_avg_sq")
+                    exp_avg_sq_l2 = (
+                        float(exp_avg_sq.detach().float().norm().item())
+                        if exp_avg_sq is not None
+                        else None
+                    )
+                    self.adamw_momentum_logger(
+                        {
+                            "optimizer_step": self._step,
+                            "param_name": self.adamw_param_name_map.get(id(param), "<unnamed>"),
+                            "exp_avg_l2": float(exp_avg_f.norm().item()),
+                            "exp_avg_mean_abs": float(exp_avg_f.abs().mean().item()),
+                            "exp_avg_max_abs": float(exp_avg_f.abs().max().item()),
+                            "exp_avg_rms": float(exp_avg_f.pow(2).mean().sqrt().item()),
+                            "exp_avg_sq_l2": exp_avg_sq_l2,
+                        }
+                    )
+
+
+class MuonSpectrumCSVLogger:
+    def __init__(self, path: Path, domain: str, optimizer: str, seed: int):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.domain = domain
+        self.optimizer = optimizer
+        self.seed = seed
+        self.handle = self.path.open("w", newline="")
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(
+            [
+                "domain",
+                "optimizer",
+                "seed",
+                "optimizer_step",
+                "param_name",
+                "update_kind",
+                "sigma_max",
+                "sigma_min",
+                "condition_number",
+                "singular_index",
+                "singular_value",
+            ]
+        )
+
+    def __call__(self, row):
+        for idx, value in enumerate(row["singular_values"]):
+            self.writer.writerow(
+                [
+                    self.domain,
+                    self.optimizer,
+                    self.seed,
+                    row["optimizer_step"],
+                    row["param_name"],
+                    row["update_kind"],
+                    row["sigma_max"],
+                    row["sigma_min"],
+                    row["condition_number"],
+                    idx,
+                    float(value),
+                ]
+            )
+
+    def close(self):
+        self.handle.close()
+
+
+class AdamWMomentumCSVLogger:
+    def __init__(self, path: Path, domain: str, optimizer: str, seed: int):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.domain = domain
+        self.optimizer = optimizer
+        self.seed = seed
+        self.handle = self.path.open("w", newline="")
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(
+            [
+                "domain",
+                "optimizer",
+                "seed",
+                "optimizer_step",
+                "param_name",
+                "exp_avg_l2",
+                "exp_avg_mean_abs",
+                "exp_avg_max_abs",
+                "exp_avg_rms",
+                "exp_avg_sq_l2",
+            ]
+        )
+
+    def __call__(self, row):
+        self.writer.writerow(
+            [
+                self.domain,
+                self.optimizer,
+                self.seed,
+                row["optimizer_step"],
+                row["param_name"],
+                row["exp_avg_l2"],
+                row["exp_avg_mean_abs"],
+                row["exp_avg_max_abs"],
+                row["exp_avg_rms"],
+                row["exp_avg_sq_l2"],
+            ]
+        )
+
+    def close(self):
+        self.handle.close()
 
 
 class CartPoleTask:
@@ -422,6 +607,30 @@ def parse_args():
         default=0.0,
         help="Weight decay for AdamW fallback parameters when using Muon.",
     )
+    parser.add_argument(
+        "--muon-spectrum-every",
+        type=int,
+        default=0,
+        help="Log Muon raw/orthogonalized update singular values every N optimizer steps (0 disables).",
+    )
+    parser.add_argument(
+        "--muon-spectrum-topk",
+        type=int,
+        default=0,
+        help="Keep only top-k singular values when logging Muon update spectra (0 keeps all).",
+    )
+    parser.add_argument(
+        "--adamw-momentum-every",
+        type=int,
+        default=0,
+        help="Log AdamW exp_avg momentum stats every N optimizer steps for AdamW/Muon-hybrid runs (0 disables).",
+    )
+    parser.add_argument(
+        "--muon-adamw-momentum-every",
+        type=int,
+        default=0,
+        help="Log AdamW exp_avg momentum stats every N optimizer steps when using Muon hybrid (0 disables).",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--cartpole-gravity-settings", nargs="+", type=float, default=[9.8, 20.0, 50.0, 500.0], help="CartPole gravity shifts.")
     parser.add_argument("--cartpole-masscart-settings", nargs="+", type=float, default=[0.1, 1.0, 1.2, 1.3, 1.5], help="CartPole masscart shifts.")
@@ -478,26 +687,50 @@ def split_muon_param_groups(model: nn.Module):
         input_output_matrix_names.add(matrix_param_names[0])
         input_output_matrix_names.add(matrix_param_names[-1])
 
-    muon_params = []
+    muon_named_params = []
     fallback_params = []
     for name, param in named_params:
         if param.ndim >= 2 and name not in input_output_matrix_names:
-            muon_params.append(param)
+            muon_named_params.append((name, param))
         else:
             fallback_params.append(param)
 
-    return muon_params, fallback_params
+    return muon_named_params, fallback_params
 
 
-def build_optimizer(parameters, spec, model=None):
+def build_optimizer(
+    parameters,
+    spec,
+    model=None,
+    muon_spectrum_logger=None,
+    muon_spectrum_every=0,
+    muon_spectrum_topk=0,
+    adamw_momentum_logger=None,
+    adamw_momentum_every=0,
+):
     if spec["name"] == "adamw":
-        return torch.optim.AdamW(parameters, lr=spec["lr"], weight_decay=spec["weight_decay"])
+        adamw_opt = torch.optim.AdamW(parameters, lr=spec["lr"], weight_decay=spec["weight_decay"])
+        if adamw_momentum_logger is None or adamw_momentum_every <= 0:
+            return adamw_opt
+        if model is None:
+            raise ValueError("AdamW momentum logging requires model to map parameter names")
+        adamw_name_map = {id(param): name for name, param in model.named_parameters() if param.requires_grad}
+        return HybridOptimizer(
+            adamw_opt,
+            adamw_momentum_logger=adamw_momentum_logger,
+            adamw_momentum_every=adamw_momentum_every,
+            adamw_param_name_map=adamw_name_map,
+        )
     if spec["name"] == "rmsprop":
         return torch.optim.RMSprop(parameters, lr=spec["lr"])
     if spec["name"] == "muon":
         if model is None:
             raise ValueError("Muon optimizer requires a model for parameter partitioning")
-        muon_params, fallback_params = split_muon_param_groups(model)
+        muon_named_params, fallback_params = split_muon_param_groups(model)
+        muon_params = [param for _name, param in muon_named_params]
+        muon_name_map = {id(param): name for name, param in muon_named_params}
+        fallback_ids = {id(param) for param in fallback_params}
+        fallback_name_map = {id(param): name for name, param in model.named_parameters() if id(param) in fallback_ids}
         muon_opt = (
             Muon(
                 muon_params,
@@ -505,6 +738,10 @@ def build_optimizer(parameters, spec, model=None):
                 momentum=spec["momentum"],
                 ns_steps=spec["ns_steps"],
                 weight_decay=spec["weight_decay"],
+                param_name_map=muon_name_map,
+                spectrum_logger=muon_spectrum_logger,
+                spectrum_every=muon_spectrum_every,
+                spectrum_topk=muon_spectrum_topk,
             )
             if muon_params
             else None
@@ -518,7 +755,13 @@ def build_optimizer(parameters, spec, model=None):
             if fallback_params
             else None
         )
-        return HybridOptimizer(muon_opt, fallback_opt)
+        return HybridOptimizer(
+            muon_opt,
+            fallback_opt,
+            adamw_momentum_logger=adamw_momentum_logger,
+            adamw_momentum_every=adamw_momentum_every,
+            adamw_param_name_map=fallback_name_map,
+        )
     return torch.optim.SGD(
         parameters,
         lr=spec["lr"],
@@ -650,7 +893,29 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     target_net = QNetwork(task.state_dim, task.action_dim).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     spec = optimizer_spec(optimizer_name, args)
-    optimizer = build_optimizer(policy_net.parameters(), spec, model=policy_net)
+    spectrum_logger = None
+    adamw_momentum_logger = None
+    if optimizer_name == "muon":
+        adamw_momentum_every = args.adamw_momentum_every if args.adamw_momentum_every > 0 else args.muon_adamw_momentum_every
+    else:
+        adamw_momentum_every = args.adamw_momentum_every
+    if optimizer_name == "muon" and args.muon_spectrum_every > 0:
+        spectrum_path = run_dir / "diagnostics" / f"{domain_name}_{optimizer_name}_seed{seed}_muon_update_spectrum.csv"
+        spectrum_logger = MuonSpectrumCSVLogger(spectrum_path, domain_name, optimizer_name, seed)
+    if optimizer_name in {"muon", "adamw"} and adamw_momentum_every > 0:
+        momentum_path = run_dir / "diagnostics" / f"{domain_name}_{optimizer_name}_seed{seed}_adamw_momentum.csv"
+        adamw_momentum_logger = AdamWMomentumCSVLogger(momentum_path, domain_name, optimizer_name, seed)
+
+    optimizer = build_optimizer(
+        policy_net.parameters(),
+        spec,
+        model=policy_net,
+        muon_spectrum_logger=spectrum_logger,
+        muon_spectrum_every=args.muon_spectrum_every,
+        muon_spectrum_topk=args.muon_spectrum_topk,
+        adamw_momentum_logger=adamw_momentum_logger,
+        adamw_momentum_every=adamw_momentum_every,
+    )
     replay_buffer = ReplayBuffer(args.buffer_size)
 
     history_rows = []
@@ -809,6 +1074,10 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
         f"elapsed={result['elapsed_seconds']:.1f}s final_eval={result['final_eval_mean_reward']}",
         flush=True,
     )
+    if spectrum_logger is not None:
+        spectrum_logger.close()
+    if adamw_momentum_logger is not None:
+        adamw_momentum_logger.close()
     return result
 
 
