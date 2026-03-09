@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 import pandas as pd
 
 matplotlib.use("Agg")
@@ -28,6 +29,12 @@ def parse_args():
         "--param-name-contains",
         default=None,
         help="Optional substring filter for parameter name.",
+    )
+    parser.add_argument(
+        "--condition-eps",
+        type=float,
+        default=1e-12,
+        help="Epsilon floor used for clipped condition number sigma_max/max(sigma_min, eps).",
     )
     return parser.parse_args()
 
@@ -94,9 +101,9 @@ def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_
             )
 
     domain = str(param_df["domain"].iloc[0])
-    seed = int(param_df["seed"].iloc[0])
     param_name = str(param_df["param_name"].iloc[0])
-    ax.set_title(f"{domain} seed={seed} param={param_name}")
+    num_seeds = int(param_df["seed"].nunique()) if "seed" in param_df.columns else 1
+    ax.set_title(f"{domain} param={param_name} (seed-avg, n={num_seeds})")
     ax.set_xlabel("Optimizer step")
     ax.set_ylabel("Singular value")
     ax.grid(alpha=0.2)
@@ -106,7 +113,7 @@ def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_
     plt.close(fig)
 
 
-def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path):
+def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path, condition_eps: float):
     import matplotlib.pyplot as plt
 
     if "condition_number" not in param_df.columns:
@@ -117,33 +124,72 @@ def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path):
     color = {"raw_update": "#1f77b4", "ortho_update": "#d62728"}
     label = {"raw_update": "raw update", "ortho_update": "orthogonalized update"}
 
+    any_curve = False
     for update_kind in ("raw_update", "ortho_update"):
+        kind_df = param_df[param_df["update_kind"] == update_kind].copy()
+        if kind_df.empty:
+            continue
+        kind_df["condition_number"] = pd.to_numeric(kind_df["condition_number"], errors="coerce")
+        kind_df["finite_condition_number"] = kind_df["condition_number"].where(np.isfinite(kind_df["condition_number"]), np.nan)
+
+        # Use clipped condition number so rank-deficient updates remain visible on plots.
+        if "sigma_max" in kind_df.columns and "sigma_min" in kind_df.columns:
+            sigma_max = pd.to_numeric(kind_df["sigma_max"], errors="coerce")
+            sigma_min = pd.to_numeric(kind_df["sigma_min"], errors="coerce").clip(lower=condition_eps)
+            kind_df["clipped_condition_number"] = sigma_max / sigma_min
+        else:
+            kind_df["clipped_condition_number"] = kind_df["finite_condition_number"]
+
         curve = (
-            param_df[param_df["update_kind"] == update_kind]
-            .groupby("optimizer_step", as_index=False)["condition_number"]
-            .mean()
+            kind_df.groupby("optimizer_step", as_index=False)
+            .agg(
+                clipped_condition_number=("clipped_condition_number", "median"),
+                finite_condition_number=("finite_condition_number", "median"),
+            )
             .sort_values("optimizer_step")
         )
-        if curve.empty:
+        if curve["clipped_condition_number"].notna().sum() == 0:
             continue
+
         ax.plot(
             curve["optimizer_step"],
-            curve["condition_number"],
+            curve["clipped_condition_number"],
             linestyle=style[update_kind],
             color=color[update_kind],
             linewidth=1.8,
-            label=label[update_kind],
+            label=f"{label[update_kind]} (clipped)",
         )
+        if curve["finite_condition_number"].notna().sum() > 0:
+            ax.plot(
+                curve["optimizer_step"],
+                curve["finite_condition_number"],
+                linestyle=":",
+                color=color[update_kind],
+                linewidth=1.2,
+                alpha=0.8,
+                label=f"{label[update_kind]} (finite-only)",
+            )
+        any_curve = True
 
     domain = str(param_df["domain"].iloc[0])
-    seed = int(param_df["seed"].iloc[0])
     param_name = str(param_df["param_name"].iloc[0])
-    ax.set_title(f"{domain} seed={seed} param={param_name} (condition number)")
+    num_seeds = int(param_df["seed"].nunique()) if "seed" in param_df.columns else 1
+    ax.set_title(f"{domain} param={param_name} condition number (seed-avg, n={num_seeds})")
     ax.set_xlabel("Optimizer step")
-    ax.set_ylabel("Condition number")
+    ax.set_ylabel("Condition number (log scale)")
     ax.set_yscale("log")
     ax.grid(alpha=0.2)
-    ax.legend()
+    if any_curve:
+        ax.legend(fontsize=8)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No finite/clipped condition number values available",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -154,6 +200,8 @@ def main():
     run_dir = Path(args.run_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else run_dir / "plots" / "muon_spectrum"
     output_dir.mkdir(parents=True, exist_ok=True)
+    for existing in output_dir.glob("*.png"):
+        existing.unlink()
 
     all_data = load_spectrum_logs(run_dir)
     all_data = maybe_filter(all_data, args)
@@ -161,13 +209,13 @@ def main():
         raise ValueError("No Muon spectrum rows match the selected filters.")
 
     plot_count = 0
-    grouped = all_data.groupby(["domain", "seed", "param_name"], as_index=False)
-    for (domain, seed, param_name), param_df in grouped:
+    grouped = all_data.groupby(["domain", "param_name"], as_index=False)
+    for (domain, param_name), param_df in grouped:
         safe_param = sanitize_filename(param_name)
-        spectrum_filename = f"{domain}_seed{seed}_{safe_param}_update_spectrum.png"
-        cond_filename = f"{domain}_seed{seed}_{safe_param}_condition_number.png"
+        spectrum_filename = f"{domain}_{safe_param}_update_spectrum_seed_avg.png"
+        cond_filename = f"{domain}_{safe_param}_condition_number_seed_avg.png"
         plot_param_spectrum(param_df, output_dir / spectrum_filename, args.max_singular_indices)
-        plot_param_condition_number(param_df, output_dir / cond_filename)
+        plot_param_condition_number(param_df, output_dir / cond_filename, args.condition_eps)
         plot_count += 1
 
     print(f"Wrote {plot_count} Muon spectrum plots to: {output_dir}")
