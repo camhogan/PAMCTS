@@ -77,9 +77,9 @@ def plot_param_momentum(param_df: pd.DataFrame, output_path: Path):
 
     domain = str(param_df["domain"].iloc[0])
     optimizer = str(param_df["optimizer"].iloc[0])
-    seed = int(param_df["seed"].iloc[0])
     param_name = str(param_df["param_name"].iloc[0])
-    ax.set_title(f"{domain} {optimizer} seed={seed} param={param_name}")
+    num_seeds = int(param_df["seed"].nunique()) if "seed" in param_df.columns else 1
+    ax.set_title(f"{domain} {optimizer} param={param_name} (seed-avg, n={num_seeds})")
     ax.set_xlabel("Optimizer step")
     ax.set_ylabel("Momentum magnitude")
     ax.grid(alpha=0.2)
@@ -94,6 +94,8 @@ def main():
     run_dir = Path(args.run_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else run_dir / "plots" / "adamw_momentum"
     output_dir.mkdir(parents=True, exist_ok=True)
+    for existing in output_dir.glob("*.png"):
+        existing.unlink()
 
     all_data = load_momentum_logs(run_dir)
     all_data = maybe_filter(all_data, args)
@@ -101,10 +103,10 @@ def main():
         raise ValueError("No AdamW momentum rows match the selected filters.")
 
     plot_count = 0
-    grouped = all_data.groupby(["domain", "optimizer", "seed", "param_name"], as_index=False)
-    for (domain, optimizer, seed, param_name), param_df in grouped:
+    grouped = all_data.groupby(["domain", "optimizer", "param_name"], as_index=False)
+    for (domain, optimizer, param_name), param_df in grouped:
         safe_param = sanitize_filename(param_name)
-        filename = f"{domain}_{optimizer}_seed{seed}_{safe_param}_adamw_momentum.png"
+        filename = f"{domain}_{optimizer}_{safe_param}_adamw_momentum_seed_avg.png"
         plot_param_momentum(param_df, output_dir / filename)
         plot_count += 1
 

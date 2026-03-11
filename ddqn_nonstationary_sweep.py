@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import random
+import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -211,6 +213,9 @@ class HybridOptimizer:
         adamw_momentum_logger=None,
         adamw_momentum_every=0,
         adamw_param_name_map=None,
+        sgd_momentum_logger=None,
+        sgd_momentum_every=0,
+        sgd_param_name_map=None,
     ):
         self.optimizers = [opt for opt in optimizers if opt is not None]
         if not self.optimizers:
@@ -218,6 +223,9 @@ class HybridOptimizer:
         self.adamw_momentum_logger = adamw_momentum_logger
         self.adamw_momentum_every = max(0, int(adamw_momentum_every))
         self.adamw_param_name_map = adamw_param_name_map or {}
+        self.sgd_momentum_logger = sgd_momentum_logger
+        self.sgd_momentum_every = max(0, int(sgd_momentum_every))
+        self.sgd_param_name_map = sgd_param_name_map or {}
         self._step = 0
 
     @property
@@ -244,6 +252,12 @@ class HybridOptimizer:
             and self._step % self.adamw_momentum_every == 0
         ):
             self._log_adamw_momentum()
+        if (
+            self.sgd_momentum_logger is not None
+            and self.sgd_momentum_every > 0
+            and self._step % self.sgd_momentum_every == 0
+        ):
+            self._log_sgd_momentum()
         return loss
 
     def state_dict(self):
@@ -263,6 +277,9 @@ class HybridOptimizer:
             if not isinstance(optimizer, torch.optim.AdamW):
                 continue
             for group in optimizer.param_groups:
+                beta1, beta2 = group["betas"]
+                eps = float(group["eps"])
+                weight_decay = float(group.get("weight_decay", 0.0))
                 for param in group["params"]:
                     state = optimizer.state.get(param)
                     if not state:
@@ -272,11 +289,31 @@ class HybridOptimizer:
                         continue
                     exp_avg_f = exp_avg.detach().float()
                     exp_avg_sq = state.get("exp_avg_sq")
-                    exp_avg_sq_l2 = (
-                        float(exp_avg_sq.detach().float().norm().item())
-                        if exp_avg_sq is not None
-                        else None
-                    )
+                    exp_avg_sq_f = exp_avg_sq.detach().float() if exp_avg_sq is not None else None
+                    exp_avg_sq_l2 = float(exp_avg_sq_f.norm().item()) if exp_avg_sq_f is not None else None
+
+                    state_step = state.get("step", 0)
+                    if isinstance(state_step, torch.Tensor):
+                        step = int(state_step.item())
+                    else:
+                        step = int(state_step)
+                    step = max(step, 1)
+                    bias_correction1 = 1.0 - beta1**step
+                    bias_correction2 = 1.0 - beta2**step
+
+                    m_hat = exp_avg_f / bias_correction1
+                    if exp_avg_sq_f is not None:
+                        v_hat = exp_avg_sq_f / bias_correction2
+                        sqrt_v_hat = v_hat.sqrt()
+                        adaptive_term = m_hat / (sqrt_v_hat + eps)
+                        wd_term = weight_decay * param.detach().float()
+                        parenthesized_term = adaptive_term + wd_term
+                        sqrt_v_hat_l2 = float(sqrt_v_hat.norm().item())
+                        parenthesized_term_l2 = float(parenthesized_term.norm().item())
+                    else:
+                        sqrt_v_hat_l2 = None
+                        parenthesized_term_l2 = None
+
                     self.adamw_momentum_logger(
                         {
                             "optimizer_step": self._step,
@@ -286,6 +323,33 @@ class HybridOptimizer:
                             "exp_avg_max_abs": float(exp_avg_f.abs().max().item()),
                             "exp_avg_rms": float(exp_avg_f.pow(2).mean().sqrt().item()),
                             "exp_avg_sq_l2": exp_avg_sq_l2,
+                            "m_hat_l2": float(m_hat.norm().item()),
+                            "sqrt_v_hat_l2": sqrt_v_hat_l2,
+                            "parenthesized_term_l2": parenthesized_term_l2,
+                        }
+                    )
+
+    def _log_sgd_momentum(self):
+        for optimizer in self.optimizers:
+            if not isinstance(optimizer, torch.optim.SGD):
+                continue
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    state = optimizer.state.get(param)
+                    if not state:
+                        continue
+                    momentum_buffer = state.get("momentum_buffer")
+                    if momentum_buffer is None:
+                        continue
+                    mb = momentum_buffer.detach().float()
+                    self.sgd_momentum_logger(
+                        {
+                            "optimizer_step": self._step,
+                            "param_name": self.sgd_param_name_map.get(id(param), "<unnamed>"),
+                            "momentum_buffer_l2": float(mb.norm().item()),
+                            "momentum_buffer_mean_abs": float(mb.abs().mean().item()),
+                            "momentum_buffer_max_abs": float(mb.abs().max().item()),
+                            "momentum_buffer_rms": float(mb.pow(2).mean().sqrt().item()),
                         }
                     )
 
@@ -358,6 +422,9 @@ class AdamWMomentumCSVLogger:
                 "exp_avg_max_abs",
                 "exp_avg_rms",
                 "exp_avg_sq_l2",
+                "m_hat_l2",
+                "sqrt_v_hat_l2",
+                "parenthesized_term_l2",
             ]
         )
 
@@ -374,6 +441,51 @@ class AdamWMomentumCSVLogger:
                 row["exp_avg_max_abs"],
                 row["exp_avg_rms"],
                 row["exp_avg_sq_l2"],
+                row["m_hat_l2"],
+                row["sqrt_v_hat_l2"],
+                row["parenthesized_term_l2"],
+            ]
+        )
+
+    def close(self):
+        self.handle.close()
+
+
+class SGDMomentumCSVLogger:
+    def __init__(self, path: Path, domain: str, optimizer: str, seed: int):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.domain = domain
+        self.optimizer = optimizer
+        self.seed = seed
+        self.handle = self.path.open("w", newline="")
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(
+            [
+                "domain",
+                "optimizer",
+                "seed",
+                "optimizer_step",
+                "param_name",
+                "momentum_buffer_l2",
+                "momentum_buffer_mean_abs",
+                "momentum_buffer_max_abs",
+                "momentum_buffer_rms",
+            ]
+        )
+
+    def __call__(self, row):
+        self.writer.writerow(
+            [
+                self.domain,
+                self.optimizer,
+                self.seed,
+                row["optimizer_step"],
+                row["param_name"],
+                row["momentum_buffer_l2"],
+                row["momentum_buffer_mean_abs"],
+                row["momentum_buffer_max_abs"],
+                row["momentum_buffer_rms"],
             ]
         )
 
@@ -555,13 +667,25 @@ def parse_args():
     parser.add_argument(
         "--optimizers",
         nargs="+",
-        default=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop", "muon"],
-        choices=["sgd", "sgd_momentum", "sgd_nag", "adamw", "rmsprop", "muon"],
+        default=["sgd", "sgd_momentum", "sgd_nag", "adam", "adamw", "rmsprop", "muon"],
+        choices=["sgd", "sgd_momentum", "sgd_nag", "adam", "adamw", "rmsprop", "muon"],
         help="Optimizers to compare.",
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=list(range(30)), help="Seeds to run.")
-    parser.add_argument("--cartpole-episodes", type=int, default=400, help="Training episodes per CartPole run.")
-    parser.add_argument("--frozenlake-episodes", type=int, default=600, help="Training episodes per FrozenLake run.")
+    parser.add_argument(
+        "--cartpole-episodes",
+        type=int,
+        default=0,
+        help="Maximum training episodes per CartPole run (0 disables episode cap).",
+    )
+    parser.add_argument(
+        "--frozenlake-episodes",
+        type=int,
+        default=0,
+        help="Maximum training episodes per FrozenLake run (0 disables episode cap).",
+    )
+    parser.add_argument("--cartpole-train-steps", type=int, default=300000, help="Environment-step training budget for CartPole.")
+    parser.add_argument("--frozenlake-train-steps", type=int, default=1000000, help="Environment-step training budget for FrozenLake.")
     parser.add_argument("--cartpole-max-steps", type=int, default=2500, help="CartPole step cap per episode.")
     parser.add_argument("--frozenlake-max-steps", type=int, default=200, help="FrozenLake step cap per episode.")
     parser.add_argument("--batch-size", type=int, default=64, help="Replay batch size.")
@@ -588,7 +712,12 @@ def parse_args():
     parser.add_argument("--sgd-lr", type=float, default=0.01, help="Learning rate for plain SGD.")
     parser.add_argument("--sgd-momentum-lr", type=float, default=0.01, help="Learning rate for SGD with momentum.")
     parser.add_argument("--sgd-nag-lr", type=float, default=0.01, help="Learning rate for SGD with Nesterov momentum.")
+    parser.add_argument("--adam-lr", type=float, default=0.001, help="Learning rate for Adam.")
+    parser.add_argument("--adam-beta1", type=float, default=0.9, help="Beta1 (first-moment momentum) for Adam.")
+    parser.add_argument("--adam-beta2", type=float, default=0.999, help="Beta2 (second-moment decay) for Adam.")
     parser.add_argument("--adamw-lr", type=float, default=0.001, help="Learning rate for AdamW.")
+    parser.add_argument("--adamw-beta1", type=float, default=0.9, help="Beta1 (first-moment momentum) for AdamW.")
+    parser.add_argument("--adamw-beta2", type=float, default=0.999, help="Beta2 (second-moment decay) for AdamW.")
     parser.add_argument("--rmsprop-lr", type=float, default=0.001, help="Learning rate for RMSprop.")
     parser.add_argument("--muon-lr", type=float, default=0.001, help="Learning rate for Muon.")
     parser.add_argument(
@@ -631,6 +760,24 @@ def parse_args():
         default=0,
         help="Log AdamW exp_avg momentum stats every N optimizer steps when using Muon hybrid (0 disables).",
     )
+    parser.add_argument(
+        "--sgd-momentum-log-every",
+        type=int,
+        default=0,
+        help="Log SGD momentum-buffer stats every N optimizer steps for sgd_momentum/sgd_nag runs (0 disables).",
+    )
+    parser.add_argument(
+        "--auto-plot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically generate standard plots at run end.",
+    )
+    parser.add_argument(
+        "--auto-plot-step-bin",
+        type=int,
+        default=100,
+        help="Step-bin size for auto-generated comparison training plots (0 disables binning).",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--cartpole-gravity-settings", nargs="+", type=float, default=[9.8, 20.0, 50.0, 500.0], help="CartPole gravity shifts.")
     parser.add_argument("--cartpole-masscart-settings", nargs="+", type=float, default=[0.1, 1.0, 1.2, 1.3, 1.5], help="CartPole masscart shifts.")
@@ -655,9 +802,24 @@ def optimizer_spec(name: str, args):
     if name == "sgd_nag":
         lr = args.shared_lr if args.shared_lr is not None else args.sgd_nag_lr
         return {"name": name, "lr": lr, "momentum": args.momentum, "nesterov": True}
+    if name == "adam":
+        lr = args.shared_lr if args.shared_lr is not None else args.adam_lr
+        return {
+            "name": name,
+            "lr": lr,
+            "weight_decay": args.weight_decay,
+            "beta1": args.adam_beta1,
+            "beta2": args.adam_beta2,
+        }
     if name == "adamw":
         lr = args.shared_lr if args.shared_lr is not None else args.adamw_lr
-        return {"name": name, "lr": lr, "weight_decay": args.weight_decay}
+        return {
+            "name": name,
+            "lr": lr,
+            "weight_decay": args.weight_decay,
+            "beta1": args.adamw_beta1,
+            "beta2": args.adamw_beta2,
+        }
     if name == "rmsprop":
         lr = args.shared_lr if args.shared_lr is not None else args.rmsprop_lr
         return {"name": name, "lr": lr}
@@ -707,9 +869,34 @@ def build_optimizer(
     muon_spectrum_topk=0,
     adamw_momentum_logger=None,
     adamw_momentum_every=0,
+    sgd_momentum_logger=None,
+    sgd_momentum_every=0,
 ):
+    if spec["name"] == "adam":
+        adam_opt = torch.optim.Adam(
+            parameters,
+            lr=spec["lr"],
+            weight_decay=spec["weight_decay"],
+            betas=(spec["beta1"], spec["beta2"]),
+        )
+        if adamw_momentum_logger is None or adamw_momentum_every <= 0:
+            return adam_opt
+        if model is None:
+            raise ValueError("Adam momentum logging requires model to map parameter names")
+        adam_name_map = {id(param): name for name, param in model.named_parameters() if param.requires_grad}
+        return HybridOptimizer(
+            adam_opt,
+            adamw_momentum_logger=adamw_momentum_logger,
+            adamw_momentum_every=adamw_momentum_every,
+            adamw_param_name_map=adam_name_map,
+        )
     if spec["name"] == "adamw":
-        adamw_opt = torch.optim.AdamW(parameters, lr=spec["lr"], weight_decay=spec["weight_decay"])
+        adamw_opt = torch.optim.AdamW(
+            parameters,
+            lr=spec["lr"],
+            weight_decay=spec["weight_decay"],
+            betas=(spec["beta1"], spec["beta2"]),
+        )
         if adamw_momentum_logger is None or adamw_momentum_every <= 0:
             return adamw_opt
         if model is None:
@@ -762,11 +949,22 @@ def build_optimizer(
             adamw_momentum_every=adamw_momentum_every,
             adamw_param_name_map=fallback_name_map,
         )
-    return torch.optim.SGD(
+    sgd_opt = torch.optim.SGD(
         parameters,
         lr=spec["lr"],
         momentum=spec.get("momentum", 0.0),
         nesterov=spec.get("nesterov", False),
+    )
+    if sgd_momentum_logger is None or sgd_momentum_every <= 0 or spec.get("momentum", 0.0) <= 0.0:
+        return sgd_opt
+    if model is None:
+        raise ValueError("SGD momentum logging requires model to map parameter names")
+    sgd_name_map = {id(param): name for name, param in model.named_parameters() if param.requires_grad}
+    return HybridOptimizer(
+        sgd_opt,
+        sgd_momentum_logger=sgd_momentum_logger,
+        sgd_momentum_every=sgd_momentum_every,
+        sgd_param_name_map=sgd_name_map,
     )
 
 
@@ -848,9 +1046,17 @@ def get_task(name: str, args):
 
 def get_domain_hyperparams(name: str, args):
     if name == "cartpole":
-        return {"episodes": args.cartpole_episodes, "gamma": args.cartpole_gamma}
+        return {
+            "episode_cap": args.cartpole_episodes,
+            "train_steps": args.cartpole_train_steps,
+            "gamma": args.cartpole_gamma,
+        }
     if name == "frozenlake":
-        return {"episodes": args.frozenlake_episodes, "gamma": args.frozenlake_gamma}
+        return {
+            "episode_cap": args.frozenlake_episodes,
+            "train_steps": args.frozenlake_train_steps,
+            "gamma": args.frozenlake_gamma,
+        }
     raise ValueError(f"Unsupported domain: {name}")
 
 
@@ -884,7 +1090,8 @@ def build_baseline_env_kwargs(domain_name: str):
 def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args, run_dir: Path, device: torch.device):
     task = get_task(domain_name, args)
     hyperparams = get_domain_hyperparams(domain_name, args)
-    episodes = hyperparams["episodes"]
+    episode_cap = hyperparams["episode_cap"]
+    train_steps = hyperparams["train_steps"]
     gamma = hyperparams["gamma"]
     set_all_seeds(seed)
 
@@ -895,6 +1102,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     spec = optimizer_spec(optimizer_name, args)
     spectrum_logger = None
     adamw_momentum_logger = None
+    sgd_momentum_logger = None
     if optimizer_name == "muon":
         adamw_momentum_every = args.adamw_momentum_every if args.adamw_momentum_every > 0 else args.muon_adamw_momentum_every
     else:
@@ -902,9 +1110,12 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     if optimizer_name == "muon" and args.muon_spectrum_every > 0:
         spectrum_path = run_dir / "diagnostics" / f"{domain_name}_{optimizer_name}_seed{seed}_muon_update_spectrum.csv"
         spectrum_logger = MuonSpectrumCSVLogger(spectrum_path, domain_name, optimizer_name, seed)
-    if optimizer_name in {"muon", "adamw"} and adamw_momentum_every > 0:
+    if optimizer_name in {"muon", "adamw", "adam"} and adamw_momentum_every > 0:
         momentum_path = run_dir / "diagnostics" / f"{domain_name}_{optimizer_name}_seed{seed}_adamw_momentum.csv"
         adamw_momentum_logger = AdamWMomentumCSVLogger(momentum_path, domain_name, optimizer_name, seed)
+    if optimizer_name in {"sgd_momentum", "sgd_nag"} and args.sgd_momentum_log_every > 0:
+        sgd_momentum_path = run_dir / "diagnostics" / f"{domain_name}_{optimizer_name}_seed{seed}_sgd_momentum.csv"
+        sgd_momentum_logger = SGDMomentumCSVLogger(sgd_momentum_path, domain_name, optimizer_name, seed)
 
     optimizer = build_optimizer(
         policy_net.parameters(),
@@ -915,6 +1126,8 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
         muon_spectrum_topk=args.muon_spectrum_topk,
         adamw_momentum_logger=adamw_momentum_logger,
         adamw_momentum_every=adamw_momentum_every,
+        sgd_momentum_logger=sgd_momentum_logger,
+        sgd_momentum_every=args.sgd_momentum_log_every,
     )
     replay_buffer = ReplayBuffer(args.buffer_size)
 
@@ -925,11 +1138,14 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
     start_time = time.time()
 
     print(
-        f"[start] domain={domain_name} optimizer={optimizer_name} seed={seed} episodes={episodes}",
+        f"[start] domain={domain_name} optimizer={optimizer_name} seed={seed} "
+        f"train_steps={train_steps} episode_cap={episode_cap}",
         flush=True,
     )
 
-    for episode in range(1, episodes + 1):
+    episode = 0
+    while total_steps < train_steps and (episode_cap <= 0 or episode < episode_cap):
+        episode += 1
         state = task.reset(env, seed + episode)
         episode_reward = 0.0
         episode_losses = []
@@ -959,7 +1175,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             if total_steps % args.target_update_frequency == 0:
                 target_net.load_state_dict(policy_net.state_dict())
 
-            if done:
+            if done or total_steps >= train_steps:
                 break
 
         history_rows.append(
@@ -975,7 +1191,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             }
         )
 
-        if episode % args.eval_every == 0 or episode == episodes:
+        if episode % args.eval_every == 0 or total_steps >= train_steps:
             baseline_rewards = evaluate_on_task(
                 policy_net,
                 task,
@@ -996,7 +1212,7 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
             )
             print(
                 f"[progress] domain={domain_name} optimizer={optimizer_name} seed={seed} "
-                f"episode={episode}/{episodes} train_reward={episode_reward:.3f} "
+                f"episode={episode} steps={total_steps}/{train_steps} train_reward={episode_reward:.3f} "
                 f"baseline_eval_mean={np.mean(baseline_rewards):.3f}",
                 flush=True,
             )
@@ -1056,7 +1272,9 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
         "optimizer": optimizer_name,
         "seed": seed,
         "optimizer_config": json.dumps(spec, sort_keys=True),
-        "episodes": episodes,
+        "episodes": episode,
+        "episode_cap": episode_cap,
+        "train_steps_budget": train_steps,
         "max_steps": task.max_steps,
         "total_steps": total_steps,
         "elapsed_seconds": time.time() - start_time,
@@ -1078,6 +1296,8 @@ def run_single_experiment(domain_name: str, optimizer_name: str, seed: int, args
         spectrum_logger.close()
     if adamw_momentum_logger is not None:
         adamw_momentum_logger.close()
+    if sgd_momentum_logger is not None:
+        sgd_momentum_logger.close()
     return result
 
 
@@ -1120,6 +1340,77 @@ def write_manifest(run_dir: Path, args):
         "args": vars(args),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def _run_plot_command(cmd):
+    print(f"[plot] running: {' '.join(cmd)}", flush=True)
+    completed = subprocess.run(cmd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        print(f"[plot] failed (exit={completed.returncode}): {' '.join(cmd)}", flush=True)
+        if completed.stdout:
+            print(completed.stdout.strip(), flush=True)
+        if completed.stderr:
+            print(completed.stderr.strip(), flush=True)
+        return False
+    if completed.stdout:
+        print(completed.stdout.strip(), flush=True)
+    return True
+
+
+def generate_auto_plots(run_dir: Path, args):
+    script_dir = Path(__file__).resolve().parent
+    python_exe = sys.executable
+    plots_dir = run_dir / "plots"
+
+    comparison_script = script_dir / "plot_ddqn_comparison.py"
+    if comparison_script.exists():
+        _run_plot_command(
+            [
+                python_exe,
+                str(comparison_script),
+                str(run_dir),
+                "--output-dir",
+                str(plots_dir / "comparison"),
+                "--step-bin",
+                str(max(0, int(args.auto_plot_step_bin))),
+            ]
+        )
+    else:
+        print(f"[plot] skipped comparison (missing {comparison_script.name})", flush=True)
+
+    diagnostics_dir = run_dir / "diagnostics"
+    has_muon_spectrum = diagnostics_dir.exists() and any(diagnostics_dir.glob("*_muon_update_spectrum.csv"))
+    has_adamw_momentum = diagnostics_dir.exists() and any(diagnostics_dir.glob("*_adamw_momentum.csv"))
+
+    muon_script = script_dir / "plot_muon_update_spectra.py"
+    if has_muon_spectrum and muon_script.exists():
+        _run_plot_command(
+            [
+                python_exe,
+                str(muon_script),
+                str(run_dir),
+                "--max-singular-indices",
+                "0",
+                "--output-dir",
+                str(plots_dir / "muon_spectrum"),
+            ]
+        )
+    elif has_muon_spectrum:
+        print(f"[plot] skipped Muon spectrum (missing {muon_script.name})", flush=True)
+
+    adamw_momentum_script = script_dir / "plot_adamw_momentum.py"
+    if has_adamw_momentum and adamw_momentum_script.exists():
+        _run_plot_command(
+            [
+                python_exe,
+                str(adamw_momentum_script),
+                str(run_dir),
+                "--output-dir",
+                str(plots_dir / "adamw_momentum"),
+            ]
+        )
+    elif has_adamw_momentum:
+        print(f"[plot] skipped AdamW momentum (missing {adamw_momentum_script.name})", flush=True)
 
 
 def main():
@@ -1169,6 +1460,8 @@ def main():
     print(f"Shifted evals: {run_dir / 'all_shift_evals.csv'}")
     if not all_shift_evals.empty:
         print(f"Shift summary: {run_dir / 'summary_shifted_envs.csv'}")
+    if args.auto_plot:
+        generate_auto_plots(run_dir, args)
 
 
 if __name__ == "__main__":

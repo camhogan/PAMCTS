@@ -30,12 +30,6 @@ def parse_args():
         default=None,
         help="Optional substring filter for parameter name.",
     )
-    parser.add_argument(
-        "--condition-eps",
-        type=float,
-        default=1e-12,
-        help="Epsilon floor used for clipped condition number sigma_max/max(sigma_min, eps).",
-    )
     return parser.parse_args()
 
 
@@ -66,8 +60,12 @@ def maybe_filter(df: pd.DataFrame, args):
     return df
 
 
-def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_indices: int):
+def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_indices: int, update_kind: str):
     import matplotlib.pyplot as plt
+
+    kind_df = param_df[param_df["update_kind"] == update_kind]
+    if kind_df.empty:
+        return False
 
     indices = sorted(param_df["singular_index"].unique().tolist())
     if max_singular_indices > 0:
@@ -75,35 +73,31 @@ def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_
 
     fig, ax = plt.subplots(figsize=(11, 6))
     colors = plt.cm.viridis([i / max(1, len(indices) - 1) for i in range(len(indices))])
-    style = {"raw_update": "--", "ortho_update": "-"}
-    kind_label = {"raw_update": "raw", "ortho_update": "ortho"}
+    kind_label = {"raw_update": "raw", "ortho_update": "orthogonalized"}
 
     for idx_pos, singular_idx in enumerate(indices):
         color = colors[idx_pos]
-        idx_df = param_df[param_df["singular_index"] == singular_idx]
-        for update_kind in ("raw_update", "ortho_update"):
-            curve = (
-                idx_df[idx_df["update_kind"] == update_kind]
-                .groupby("optimizer_step", as_index=False)["singular_value"]
-                .mean()
-                .sort_values("optimizer_step")
-            )
-            if curve.empty:
-                continue
-            ax.plot(
-                curve["optimizer_step"],
-                curve["singular_value"],
-                linestyle=style[update_kind],
-                color=color,
-                linewidth=1.4,
-                alpha=0.95,
-                label=f"s{singular_idx} {kind_label[update_kind]}",
-            )
+        idx_df = kind_df[kind_df["singular_index"] == singular_idx]
+        curve = (
+            idx_df.groupby("optimizer_step", as_index=False)["singular_value"]
+            .mean()
+            .sort_values("optimizer_step")
+        )
+        if curve.empty:
+            continue
+        ax.plot(
+            curve["optimizer_step"],
+            curve["singular_value"],
+            color=color,
+            linewidth=1.6,
+            alpha=0.95,
+            label=f"s{singular_idx}",
+        )
 
     domain = str(param_df["domain"].iloc[0])
     param_name = str(param_df["param_name"].iloc[0])
     num_seeds = int(param_df["seed"].nunique()) if "seed" in param_df.columns else 1
-    ax.set_title(f"{domain} param={param_name} (seed-avg, n={num_seeds})")
+    ax.set_title(f"{domain} param={param_name} {kind_label.get(update_kind, update_kind)} singular values (seed-avg, n={num_seeds})")
     ax.set_xlabel("Optimizer step")
     ax.set_ylabel("Singular value")
     ax.grid(alpha=0.2)
@@ -111,9 +105,10 @@ def plot_param_spectrum(param_df: pd.DataFrame, output_path: Path, max_singular_
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
+    return True
 
 
-def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path, condition_eps: float):
+def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path):
     import matplotlib.pyplot as plt
 
     if "condition_number" not in param_df.columns:
@@ -130,45 +125,24 @@ def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path, condi
         if kind_df.empty:
             continue
         kind_df["condition_number"] = pd.to_numeric(kind_df["condition_number"], errors="coerce")
-        kind_df["finite_condition_number"] = kind_df["condition_number"].where(np.isfinite(kind_df["condition_number"]), np.nan)
-
-        # Use clipped condition number so rank-deficient updates remain visible on plots.
-        if "sigma_max" in kind_df.columns and "sigma_min" in kind_df.columns:
-            sigma_max = pd.to_numeric(kind_df["sigma_max"], errors="coerce")
-            sigma_min = pd.to_numeric(kind_df["sigma_min"], errors="coerce").clip(lower=condition_eps)
-            kind_df["clipped_condition_number"] = sigma_max / sigma_min
-        else:
-            kind_df["clipped_condition_number"] = kind_df["finite_condition_number"]
+        kind_df["condition_number"] = kind_df["condition_number"].where(np.isfinite(kind_df["condition_number"]), np.nan)
 
         curve = (
             kind_df.groupby("optimizer_step", as_index=False)
-            .agg(
-                clipped_condition_number=("clipped_condition_number", "median"),
-                finite_condition_number=("finite_condition_number", "median"),
-            )
+            .agg(condition_number=("condition_number", "median"))
             .sort_values("optimizer_step")
         )
-        if curve["clipped_condition_number"].notna().sum() == 0:
+        if curve["condition_number"].notna().sum() == 0:
             continue
 
         ax.plot(
             curve["optimizer_step"],
-            curve["clipped_condition_number"],
+            curve["condition_number"],
             linestyle=style[update_kind],
             color=color[update_kind],
             linewidth=1.8,
-            label=f"{label[update_kind]} (clipped)",
+            label=label[update_kind],
         )
-        if curve["finite_condition_number"].notna().sum() > 0:
-            ax.plot(
-                curve["optimizer_step"],
-                curve["finite_condition_number"],
-                linestyle=":",
-                color=color[update_kind],
-                linewidth=1.2,
-                alpha=0.8,
-                label=f"{label[update_kind]} (finite-only)",
-            )
         any_curve = True
 
     domain = str(param_df["domain"].iloc[0])
@@ -185,7 +159,7 @@ def plot_param_condition_number(param_df: pd.DataFrame, output_path: Path, condi
         ax.text(
             0.5,
             0.5,
-            "No finite/clipped condition number values available",
+            "No finite condition-number values available",
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -212,13 +186,15 @@ def main():
     grouped = all_data.groupby(["domain", "param_name"], as_index=False)
     for (domain, param_name), param_df in grouped:
         safe_param = sanitize_filename(param_name)
-        spectrum_filename = f"{domain}_{safe_param}_update_spectrum_seed_avg.png"
+        raw_filename = f"{domain}_{safe_param}_raw_update_spectrum_seed_avg.png"
+        ortho_filename = f"{domain}_{safe_param}_ortho_update_spectrum_seed_avg.png"
         cond_filename = f"{domain}_{safe_param}_condition_number_seed_avg.png"
-        plot_param_spectrum(param_df, output_dir / spectrum_filename, args.max_singular_indices)
-        plot_param_condition_number(param_df, output_dir / cond_filename, args.condition_eps)
-        plot_count += 1
+        wrote_raw = plot_param_spectrum(param_df, output_dir / raw_filename, args.max_singular_indices, update_kind="raw_update")
+        wrote_ortho = plot_param_spectrum(param_df, output_dir / ortho_filename, args.max_singular_indices, update_kind="ortho_update")
+        plot_param_condition_number(param_df, output_dir / cond_filename)
+        plot_count += int(wrote_raw) + int(wrote_ortho)
 
-    print(f"Wrote {plot_count} Muon spectrum plots to: {output_dir}")
+    print(f"Wrote {plot_count} Muon singular-value plots (plus condition-number plots) to: {output_dir}")
 
 
 if __name__ == "__main__":
