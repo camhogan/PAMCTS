@@ -37,42 +37,116 @@ pip install --upgrade botocore google-auth
 ```
 
 ## Run Experiments
-### DDQN Non-Stationary Optimizer Sweep (CartPole + FrozenLake)
-Run from the repo root:
+### DDQN Non-Stationary Optimizer Sweep
+Run from repo root:
 ```
-./venvPAM/bin/python ddqn_nonstationary_sweep.py \
+python3 ddqn_nonstationary_sweep.py \
   --domains cartpole frozenlake \
-  --optimizers sgd sgd_momentum sgd_nag adamw rmsprop muon \
-  --output-dir results/ddqn_nonstationary_sweep
+  --optimizers sgd sgd_momentum sgd_nag adam adamw rmsprop muon \
+  --output-dir "results/ddqn_nonstationary_sweep_$(date +%Y%m%d_%H%M%S)"
 ```
 
+Default training is step-budgeted:
+```
+--cartpole-train-steps 300000
+--frozenlake-train-steps 1000000
+--cartpole-episodes 0
+--frozenlake-episodes 0
+```
 
-The script writes a timestamped run folder:
+The script writes:
 ```
-results/ddqn_nonstationary_sweep/run_YYYYMMDD_HHMMSS/
+results/<output_dir>/run_YYYYMMDD_HHMMSS/
 ```
 
-Key output files:
+Key files in each run folder:
 ```
+raw_results.csv
 summary_training.csv
 summary_shifted_envs.csv
 all_histories.csv
 all_evals.csv
 all_shift_evals.csv
+manifest.json
 ```
 
-Plot a single run:
+### Common run examples
+CartPole-only, 100k steps:
 ```
-env MPLCONFIGDIR=/tmp/mpl ./venvPAM/bin/python plot_ddqn_results.py \
-  results/ddqn_nonstationary_sweep/run_YYYYMMDD_HHMMSS
+python3 ddqn_nonstationary_sweep.py \
+  --domains cartpole \
+  --optimizers sgd sgd_momentum sgd_nag adam adamw rmsprop muon \
+  --seeds $(seq 0 29) \
+  --cartpole-episodes 0 \
+  --cartpole-train-steps 100000 \
+  --output-dir "results/ddqn_cartpole_100k_$(date +%Y%m%d_%H%M%S)"
 ```
 
-Compare two runs in one set of plots (example: baseline optimizer run + MUON run):
+CartPole-only with Muon spectrum + momentum diagnostics:
 ```
-env MPLCONFIGDIR=/tmp/mpl ./venvPAM/bin/python plot_ddqn_comparison.py \
-  results/ddqn_nonstationary_sweep/run_20260302_205258 \
-  results/ddqn_nonstationary_sweep_muon/run_YYYYMMDD_HHMMSS \
-  --output-dir results/ddqn_nonstationary_comparison_plots
+python3 ddqn_nonstationary_sweep.py \
+  --domains cartpole \
+  --optimizers sgd sgd_momentum sgd_nag adam adamw rmsprop muon \
+  --seeds $(seq 0 29) \
+  --cartpole-episodes 0 \
+  --cartpole-train-steps 100000 \
+  --muon-spectrum-every 100 \
+  --muon-spectrum-topk 0 \
+  --adamw-momentum-every 100 \
+  --sgd-momentum-log-every 100 \
+  --output-dir "results/ddqn_cartpole_100k_diag_$(date +%Y%m%d_%H%M%S)"
+```
+
+Adam/AdamW no first-moment momentum vs RMSProp:
+```
+python3 ddqn_nonstationary_sweep.py \
+  --domains cartpole \
+  --optimizers adam adamw rmsprop \
+  --seeds $(seq 0 29) \
+  --cartpole-episodes 0 \
+  --cartpole-train-steps 100000 \
+  --adam-beta1 0.0 \
+  --adamw-beta1 0.0 \
+  --adamw-momentum-every 100 \
+  --output-dir "results/ddqn_cartpole_100k_adam_adamw_nomom_vs_rmsprop_$(date +%Y%m%d_%H%M%S)"
+```
+
+### Plotting
+Auto-plotting is enabled by default at end of sweep (`--auto-plot`):
+```
+plots/comparison/
+plots/muon_spectrum/        # only when Muon spectrum logs exist
+plots/adamw_momentum/       # only when Adam/AdamW/Muon momentum logs exist
+```
+
+Auto-plot options:
+```
+--auto-plot / --no-auto-plot
+--auto-plot-step-bin 100
+```
+
+Manual plotting commands (if needed):
+```
+MPLCONFIGDIR=/tmp/matplotlib venvPAM/bin/python plot_ddqn_comparison.py <RUN_DIR> \
+  --output-dir <RUN_DIR>/plots/comparison \
+  --step-bin 100
+```
+
+```
+MPLCONFIGDIR=/tmp/matplotlib venvPAM/bin/python plot_muon_update_spectra.py <RUN_DIR> \
+  --output-dir <RUN_DIR>/plots/muon_spectrum \
+  --max-singular-indices 0
+```
+
+```
+MPLCONFIGDIR=/tmp/matplotlib venvPAM/bin/python plot_adamw_momentum.py <RUN_DIR> \
+  --output-dir <RUN_DIR>/plots/adamw_momentum
+```
+
+```
+MPLCONFIGDIR=/tmp/matplotlib venvPAM/bin/python plot_optimizer_momentum_comparison.py <RUN_DIR> \
+  --output-dir <RUN_DIR>/plots/momentum_comparison \
+  --metric l2
 ```
 
 ### Cartpole:
