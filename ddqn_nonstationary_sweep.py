@@ -684,7 +684,7 @@ def parse_args():
         default=0,
         help="Maximum training episodes per FrozenLake run (0 disables episode cap).",
     )
-    parser.add_argument("--cartpole-train-steps", type=int, default=300000, help="Environment-step training budget for CartPole.")
+    parser.add_argument("--cartpole-train-steps", type=int, default=100000, help="Environment-step training budget for CartPole.")
     parser.add_argument("--frozenlake-train-steps", type=int, default=1000000, help="Environment-step training budget for FrozenLake.")
     parser.add_argument("--cartpole-max-steps", type=int, default=2500, help="CartPole step cap per episode.")
     parser.add_argument("--frozenlake-max-steps", type=int, default=200, help="FrozenLake step cap per episode.")
